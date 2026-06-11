@@ -350,7 +350,7 @@ This returns all active ServiceRequests where organisation `R69` is the performe
 | Should we use e-RS worklists? | **No** — worklists are an e-RS UI concept tied to STU3 and CIS2 user context |
 | Should we use BaRS `GET /ServiceRequest`? | **Yes** — standard FHIR R4, RESTful, composable, system-to-system capable |
 | What's missing from BaRS today? | Organisation-scoped queries (`performer`), status filtering, pagination, sorting |
-| How much work is this? | Moderate — new search parameters on an existing endpoint, plus backend query optimisation for large result sets |
+| How much work is this? | **Low for BaRS, significant for e-RS.** The BaRS API/standard changes are small — adding new search parameters to an existing endpoint is additive and non-breaking. The real effort is on the e-RS side: building the adapter that receives these queries, translates them into e-RS internal calls, transforms STU3 ReferralRequest data into R4 ServiceRequest responses, and handles the volume/performance characteristics of organisation-scoped queries across millions of referrals. |
 | Is this a breaking change? | **No** — adding new search parameters is additive; existing patient-scoped queries continue to work |
 
 ---

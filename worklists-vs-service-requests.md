@@ -449,32 +449,37 @@ e-RS Database (ersdb) → ETL Pipeline → BaRS Data Store (DynamoDB)
 
 New referrals (created after a cutover date) are handled by a **new Referral Service** — a discrete, modern backend that stores referrals natively as R4 ServiceRequests. Legacy referrals (before the cutover) continue to be served from `ersdb` via a translation facade.
 
-BaRS remains what it is: a **standard and an API proxy**. It does not hold referral data. It routes requests to whichever backend owns the data — the new Referral Service for post-cutover referrals, and the legacy e-RS for pre-cutover referrals.
+BaRS remains what it is: a **standard and an API proxy**. It does not hold referral data. It is just transport — passing the request to the backend that handles it.
 
 This approach supports the wider strategic goal of **replacing the monolithic e-RS with discrete services** — a dedicated Referral Service, a dedicated Booking Service, etc. — each independently deployable, each conforming to the BaRS standard, and each owning its own data store.
 
 ```
-Consumer → BaRS Proxy (GET /ServiceRequest)
-                ↓
-        ┌───────┴───────┐
-        │               │
-   New Referral      Legacy e-RS
-   Service           (ersdb + facade)
-   (R4 native)      (STU3 → R4 translation)
-        │               │
-        └───────┬───────┘
-                ↓
-         Merged R4 Bundle returned via Proxy
+Consumer → BaRS Proxy (just transport) → New Referral Service
+                                                ↓
+                                    ┌───────────┴───────────┐
+                                    │                       │
+                              Own data store          Legacy e-RS facade
+                              (R4 native)            (ersdb, STU3 → R4)
+                                    │                       │
+                                    └───────────┬───────────┘
+                                                ↓
+                                    Merge + deduplicate
+                                    (Referral Service responsibility)
+                                                ↓
+                                         R4 Bundle returned via Proxy
 ```
 
 **How it works:**
 
 1. Consumer calls `GET /ServiceRequest?performer:identifier=...`
-2. BaRS Proxy routes the request to both backends (or routes based on a date/identifier heuristic)
-3. The **new Referral Service** queries its own data store for post-cutover referrals (already R4)
-4. The **legacy e-RS facade** queries `ersdb` for pre-cutover referrals and transforms STU3 → R4
-5. Both result sets are merged, deduplicated, and returned as a single R4 Bundle via the Proxy
-6. Over time, as legacy referrals are completed/cancelled, the facade handles fewer requests
+2. BaRS Proxy passes the request to the **new Referral Service** — BaRS is just transport, it does not process, merge, or transform anything
+3. The **new Referral Service** handles the query:
+   - It queries its own data store for post-cutover referrals (already R4)
+   - It calls the **legacy e-RS facade** to retrieve pre-cutover referrals (STU3 → R4 translation happens in the facade)
+   - It **merges** both result sets, deduplicates, and assembles the final R4 Bundle
+4. The new Referral Service returns the complete R4 Bundle
+5. BaRS Proxy forwards the response to the consumer unchanged
+6. Over time, as legacy referrals reach terminal states, the facade handles fewer requests
 7. Eventually, all active data is in the new Referral Service and the facade can be retired
 
 **Key point — where the data lives:**
@@ -517,8 +522,8 @@ Each service owns its data, conforms to the BaRS standard, and is accessible thr
 
 1. Build a **new Referral Service** — a discrete backend that stores referrals natively as R4 ServiceRequests. This service sits behind the BaRS Proxy and is the long-term replacement for e-RS referral management.
 2. Define a **cutover date** after which all new referrals are created via the new Referral Service
-3. Build a **lightweight facade** on the legacy e-RS that translates STU3 data to R4 on demand for pre-cutover referrals
-4. The BaRS Proxy routes to both, merging responses into a single R4 Bundle
+3. Build a **lightweight facade** on the legacy e-RS that the new Referral Service can call to retrieve and translate pre-cutover referrals
+4. The **new Referral Service** is responsible for merging its own data with legacy data from the facade — BaRS Proxy is just transport
 5. As legacy referrals reach terminal states (completed, cancelled), they fall out of active queries
 6. Retire the facade when the volume of active legacy referrals reaches zero
 

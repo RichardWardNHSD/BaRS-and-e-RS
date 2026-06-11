@@ -370,19 +370,22 @@ If the strategic direction is `GET /ServiceRequest` (FHIR R4), there is a questi
 A translation layer sits between the BaRS API and the e-RS backend, mapping STU3 `ReferralRequest` resources to R4 `ServiceRequest` on the fly.
 
 ```
-Consumer → BaRS API (GET /ServiceRequest) → Adapter → e-RS API ($ers.fetchworklist or GET /ReferralRequest)
-                                                ↓
-                                          STU3 → R4 mapping
-                                                ↓
-                                          Return as R4 ServiceRequest
+Consumer → BaRS Proxy (GET /ServiceRequest) → e-RS Backend (query, transform, respond)
+                                                    ↓
+                                          ersdb query (STU3 ReferralRequest)
+                                                    ↓
+                                          STU3 → R4 mapping (e-RS responsibility)
+                                                    ↓
+                                          R4 ServiceRequest Bundle returned via Proxy
 ```
 
 **How it works:**
 
 1. Consumer calls `GET /ServiceRequest?performer:identifier=...&status=active`
-2. The BaRS backend (or a dedicated adapter) calls the e-RS API internally to fetch matching referrals
-3. The adapter transforms each STU3 `ReferralRequest` into an R4 `ServiceRequest` using a defined mapping
-4. Results are returned to the consumer as a standard FHIR R4 Bundle
+2. The BaRS Proxy receives the request and routes it to the e-RS backend — BaRS is a standard and an API proxy, not a data store for referrals. It passes the request through and waits for a response.
+3. The e-RS backend handles the query internally: fetching matching referrals from `ersdb`, transforming each STU3 `ReferralRequest` into an R4 `ServiceRequest` using the defined mapping
+4. e-RS returns the R4 Bundle to the BaRS Proxy
+5. The BaRS Proxy forwards the response to the consumer
 
 **Mapping: STU3 ReferralRequest → R4 ServiceRequest**
 

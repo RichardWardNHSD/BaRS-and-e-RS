@@ -96,6 +96,147 @@ NHSD-End-User-Organisation: {base64-encoded org}
 NHSD-Target-Identifier: {base64-encoded target service}
 ```
 
+**Example response (BaRS) — patient-scoped:**
+
+```json
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 2,
+  "entry": [
+    {
+      "fullUrl": "https://int.api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest/79120f41-a431-4f08-bcc5-1e67006fcae0",
+      "resource": {
+        "resourceType": "ServiceRequest",
+        "id": "79120f41-a431-4f08-bcc5-1e67006fcae0",
+        "meta": {
+          "lastUpdated": "2025-06-01T09:30:00+00:00",
+          "profile": ["https://fhir.hl7.org.uk/StructureDefinition/UKCore-ServiceRequest"]
+        },
+        "status": "active",
+        "intent": "order",
+        "priority": "routine",
+        "code": {
+          "coding": [{
+            "system": "https://fhir.nhs.uk/CodeSystem/usecases-categories-bars",
+            "code": "a1t1",
+            "display": "111 to ED"
+          }]
+        },
+        "subject": {
+          "reference": "Patient/788660eb-d2c9-4773-abd4-318484673fb2",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/nhs-number",
+            "value": "9876543210"
+          },
+          "display": "John Smith"
+        },
+        "authoredOn": "2025-06-01T09:15:00+00:00",
+        "requester": {
+          "reference": "Organization/sender-org-001",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/ods-organization-code",
+            "value": "RYG"
+          },
+          "display": "Sender GP Practice"
+        },
+        "performer": [{
+          "reference": "Organization/receiver-org-001",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/ods-organization-code",
+            "value": "RXF"
+          },
+          "display": "Anytown UTC"
+        }]
+      }
+    },
+    {
+      "fullUrl": "https://int.api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest/a5b6c7d8-e9f0-1234-5678-90abcdef1234",
+      "resource": {
+        "resourceType": "ServiceRequest",
+        "id": "a5b6c7d8-e9f0-1234-5678-90abcdef1234",
+        "meta": {
+          "lastUpdated": "2025-05-28T14:00:00+00:00",
+          "profile": ["https://fhir.hl7.org.uk/StructureDefinition/UKCore-ServiceRequest"]
+        },
+        "status": "completed",
+        "intent": "order",
+        "priority": "urgent",
+        "code": {
+          "coding": [{
+            "system": "https://fhir.nhs.uk/CodeSystem/usecases-categories-bars",
+            "code": "a1t1",
+            "display": "111 to ED"
+          }]
+        },
+        "subject": {
+          "reference": "Patient/788660eb-d2c9-4773-abd4-318484673fb2",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/nhs-number",
+            "value": "9876543210"
+          },
+          "display": "John Smith"
+        },
+        "authoredOn": "2025-05-28T13:45:00+00:00",
+        "requester": {
+          "reference": "Organization/sender-org-002",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/ods-organization-code",
+            "value": "A1001"
+          },
+          "display": "Another GP Practice"
+        },
+        "performer": [{
+          "reference": "Organization/receiver-org-001",
+          "identifier": {
+            "system": "https://fhir.nhs.uk/Id/ods-organization-code",
+            "value": "RXF"
+          },
+          "display": "Anytown UTC"
+        }]
+      }
+    }
+  ]
+}
+```
+
+**Example response (BaRS) — organisation-scoped (target state):**
+
+```http
+GET /ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|RXF&status=active HTTP/1.1
+```
+
+Response is the same Bundle format as above, but filtered by the performing organisation rather than patient. The same ServiceRequest resources are returned — the only difference is the query axis.
+
+**Example response (e-RS worklist — for comparison):**
+
+```json
+{
+  "resourceType": "List",
+  "meta": {
+    "profile": ["https://fhir.nhs.uk/STU3/StructureDefinition/eRS-Worklist-List-1"]
+  },
+  "status": "current",
+  "mode": "snapshot",
+  "entry": [
+    {
+      "item": {
+        "reference": "ReferralRequest/000000070000",
+        "display": "UBRN 000000070000"
+      }
+    },
+    {
+      "item": {
+        "reference": "ReferralRequest/000000070001",
+        "display": "UBRN 000000070001"
+      }
+    }
+  ]
+}
+```
+
+Note: The e-RS worklist returns a List of **references** (UBRNs) — not the full referral data. Each referral must then be fetched individually. BaRS returns the full ServiceRequest resources inline.
+
 ---
 
 ## Key Differences
@@ -211,6 +352,154 @@ This returns all active ServiceRequests where organisation `R69` is the performe
 | What's missing from BaRS today? | Organisation-scoped queries (`performer`), status filtering, pagination, sorting |
 | How much work is this? | Moderate — new search parameters on an existing endpoint, plus backend query optimisation for large result sets |
 | Is this a breaking change? | **No** — adding new search parameters is additive; existing patient-scoped queries continue to work |
+
+---
+
+## Surfacing Legacy e-RS Referral Data as FHIR R4
+
+### The Problem
+
+The e-RS system holds millions of historical referrals in its STU3/proprietary data model. These referrals are stored in the `ersdb` database and are only accessible today through the e-RS API (STU3 `ReferralRequest`).
+
+If the strategic direction is `GET /ServiceRequest` (FHIR R4), there is a question: **how do consumers access legacy e-RS referral data through the new R4 interface?**
+
+### Options for Legacy Data Access
+
+#### Option 1: Facade / Adapter Service
+
+A translation layer sits between the BaRS API and the e-RS backend, mapping STU3 `ReferralRequest` resources to R4 `ServiceRequest` on the fly.
+
+```
+Consumer → BaRS API (GET /ServiceRequest) → Adapter → e-RS API ($ers.fetchworklist or GET /ReferralRequest)
+                                                ↓
+                                          STU3 → R4 mapping
+                                                ↓
+                                          Return as R4 ServiceRequest
+```
+
+**How it works:**
+
+1. Consumer calls `GET /ServiceRequest?performer:identifier=...&status=active`
+2. The BaRS backend (or a dedicated adapter) calls the e-RS API internally to fetch matching referrals
+3. The adapter transforms each STU3 `ReferralRequest` into an R4 `ServiceRequest` using a defined mapping
+4. Results are returned to the consumer as a standard FHIR R4 Bundle
+
+**Mapping: STU3 ReferralRequest → R4 ServiceRequest**
+
+| STU3 ReferralRequest field | R4 ServiceRequest field | Notes |
+|---|---|---|
+| `ReferralRequest.id` (UBRN) | `ServiceRequest.identifier` | UBRN becomes a business identifier, not the resource ID |
+| `ReferralRequest.status` | `ServiceRequest.status` | Values map: `active` → `active`, `completed` → `completed`, `cancelled` → `revoked` |
+| `ReferralRequest.intent` | `ServiceRequest.intent` | Typically `order` |
+| `ReferralRequest.priority` | `ServiceRequest.priority` | Direct map: `routine`, `urgent` |
+| `ReferralRequest.subject` | `ServiceRequest.subject` | Patient reference (NHS Number) |
+| `ReferralRequest.requester.agent` | `ServiceRequest.requester` | Requesting organisation/practitioner |
+| `ReferralRequest.recipient` | `ServiceRequest.performer` | Receiving organisation |
+| `ReferralRequest.authoredOn` | `ServiceRequest.authoredOn` | Date the referral was created |
+| `ReferralRequest.specialty` | `ServiceRequest.code` | Clinical specialty (may need code system mapping) |
+| `ReferralRequest.serviceRequested` | `ServiceRequest.category` | Service type requested |
+| `ReferralRequest.description` | `ServiceRequest.note` | Free-text referral reason |
+| (e-RS extension) shortlist | `ServiceRequest.locationReference` | Services on the patient's shortlist |
+
+**Pros:**
+- Single interface for consumers — R4 only, regardless of where the data lives
+- Legacy data is accessible without consumers needing to integrate with e-RS directly
+- Mapping is well-defined (STU3 → R4 mappings exist in the FHIR community)
+
+**Cons:**
+- Runtime translation adds latency
+- Not all STU3 fields map cleanly to R4 (some e-RS extensions have no R4 equivalent)
+- The adapter must handle e-RS authentication (CIS2 or app-restricted) on behalf of the caller
+- Maintenance burden — changes to either the e-RS API or the R4 model require adapter updates
+
+#### Option 2: Data Migration (Batch ETL)
+
+Legacy e-RS referrals are migrated into the BaRS data store as R4 ServiceRequest resources. The migration runs as a batch ETL process, transforming and loading historical data.
+
+```
+e-RS Database (ersdb) → ETL Pipeline → BaRS Data Store (DynamoDB)
+                              ↓
+                    STU3 → R4 transformation
+                    Deduplication
+                    Validation
+```
+
+**How it works:**
+
+1. A batch process reads referrals from `ersdb` (or via the e-RS API)
+2. Each `ReferralRequest` is transformed to an R4 `ServiceRequest` using the mapping above
+3. The R4 resources are written to the BaRS data store
+4. The BaRS API serves them natively via `GET /ServiceRequest` — no runtime translation
+
+**Pros:**
+- No runtime overhead — data is pre-transformed and served natively
+- Single data store, single query path
+- Full FHIR R4 compliance — no facade leaking STU3 semantics
+
+**Cons:**
+- Large migration effort (millions of referrals)
+- Point-in-time snapshot — ongoing sync needed for referrals still being updated in e-RS
+- Data ownership question — who is the system of record? e-RS or BaRS?
+- Storage cost for duplicating data
+
+#### Option 3: Hybrid — New Data in BaRS, Legacy via Facade
+
+New referrals (created after a cutover date) are created in BaRS natively as R4 ServiceRequests. Legacy referrals (before the cutover) are served via a facade to e-RS.
+
+```
+Consumer → BaRS API (GET /ServiceRequest)
+                ↓
+        ┌───────┴───────┐
+        │               │
+   BaRS Data Store   e-RS Adapter
+   (new referrals)   (legacy referrals)
+        │               │
+        └───────┬───────┘
+                ↓
+         Merged R4 Bundle
+```
+
+**How it works:**
+
+1. Consumer calls `GET /ServiceRequest?performer:identifier=...`
+2. BaRS queries its own data store for post-cutover referrals
+3. BaRS queries e-RS (via adapter) for pre-cutover referrals
+4. Both result sets are merged, deduplicated, and returned as a single R4 Bundle
+5. Over time, as legacy referrals are completed/cancelled, the e-RS adapter handles fewer and fewer requests
+6. Eventually, all active data is in BaRS and the adapter can be retired
+
+**Pros:**
+- No big-bang migration needed
+- New data is clean R4 from day one
+- Legacy access degrades gracefully as referrals age out
+- Clear system of record: BaRS for new, e-RS for legacy
+
+**Cons:**
+- Merge logic adds complexity (deduplication, consistent ordering)
+- Two data sources in flight during transition period
+- Consumer sees a single interface but backend complexity is significant
+- Performance depends on the slower of the two backends
+
+### Recommendation
+
+**Option 3 (Hybrid)** is the most pragmatic approach for a phased transition:
+
+1. Define a **cutover date** after which all new referrals are created via BaRS as R4 ServiceRequests
+2. Build a **lightweight e-RS adapter** that translates legacy STU3 data to R4 on demand
+3. Serve both through the same `GET /ServiceRequest` endpoint with merge logic
+4. As legacy referrals reach terminal states (completed, cancelled), they fall out of active queries
+5. Retire the adapter when the volume of active legacy referrals reaches zero
+
+### Key Design Decisions Needed
+
+| # | Decision | Impact |
+|---|---|---|
+| 1 | What is the cutover date? (When do new referrals stop going to e-RS?) | Determines how long the adapter runs |
+| 2 | Do we migrate completed/cancelled referrals, or only active ones? | Affects migration volume and storage |
+| 3 | How does the adapter authenticate to e-RS? (Service account? Delegated CIS2?) | Security model |
+| 4 | Who is the system of record during the transition? (For updates — if a legacy referral is modified, where does the write go?) | Data integrity |
+| 5 | How do we handle e-RS extensions that have no R4 equivalent? (Drop them? Map to R4 extensions?) | Data fidelity |
+| 6 | Should legacy referrals carry a provenance indicator (e.g., `meta.source = "e-RS"`) so consumers know the origin? | Transparency |
 
 ---
 

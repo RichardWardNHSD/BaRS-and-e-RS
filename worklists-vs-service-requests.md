@@ -542,6 +542,106 @@ BaRS remains a standard and a proxy throughout — it never owns referral data.
 
 ---
 
+## Event-Driven Notifications (Pub/Sub)
+
+### The Problem with Polling
+
+Even with `GET /ServiceRequest` supporting organisation-scoped queries, consumers still need to **poll** the API regularly to detect changes. This is the same fundamental problem that plagues the current e-RS worklist integration pattern:
+
+- <cite index="4-7">The typical strategy is to regularly poll the A008 Retrieve Referral Worklist end point in order to obtain a list of UBRNS.</cite> <cite index="4-8">Then poll the A005 endpoint for each referral, each time an update is required.</cite>
+- <cite index="4-9">There is no mechanism to discover if the state of a referral has changed, other than to retrieve the complete referral details.</cite>
+- <cite index="4-10,4-11,4-12">As a result of this, integrating systems have no choice but to large amounts of data out of eRS in order to keep their records in sync. The majority of this data is redundant. This puts a high load on the eRS system, while providing a poor integration experience for partners; many users experience long sync delays between eRS and local systems.</cite>
+
+The org-scoped `GET /ServiceRequest` (with version IDs) improves this significantly — consumers can detect changes without fetching every referral — but it's still polling. The final step is **push-based notifications**.
+
+### What Integrators Need
+
+<cite index="4-19">Ability to get a list of all the referrals relevant to a site / organisation without depending on worklists. Ability to easily tell if a referral has changed. Ability to get immediate notifications of referrals that are relevant to a site of organisation which have changed. Ability to perform these actions using application restricted access. A relatively accessible upgrade path for integrators.</cite>
+
+### Three-Stage Solution
+
+The path from the current state to event-driven notifications is a three-stage journey. Each stage is independently valuable and builds on the previous:
+
+#### Stage 1: Version IDs in Responses (Quick Fix)
+
+<cite index="4-20,4-21">Include referral version id in worklist payload. Already in progress, we are adding a version number to the referral details returned by the A008 Retrieve Referral Worklist endpoint.</cite>
+
+<cite index="4-22,4-23">This will remove the need for integrating systems to poll every referral that is currently relevant to them. Instead they call poll the worklist, check the version numbers against those they currently hold and only request details for the referrals which have changed.</cite>
+
+In the BaRS context, this translates to including `meta.versionId` on every ServiceRequest in the `GET /ServiceRequest` response. Consumers compare version IDs against their local store and only fetch full details for changed referrals.
+
+**Fixes:** Change detection without full data pull.
+**Doesn't fix:** Still requires polling; still org-scoped query needed; still no push notifications.
+
+#### Stage 2: Organisation-Scoped GET /ServiceRequest (The Foundation)
+
+<cite index="4-26,4-27,4-28">Create a new integration focused Get Referrals API endpoint. This would allow a list of referrals to be retrieved with filter criteria applied. Specifics TBA, the intention is for an integrating system to provide something like a provider ODS code or a referrer ODS code and get a list of referrals which are relevant to them.</cite>
+
+<cite index="4-31">Ideally this would be BaRS compliant, based on Get referral/s for patient: https://digital.nhs.uk/developer/api-catalogue/booking-and-referral-fhir/v1.3.0#get-/ServiceRequest</cite>
+
+This is exactly what we've described earlier in this document — adding `performer:identifier`, `status`, and other search parameters to `GET /ServiceRequest`. The e-RS team's own analysis aligns with the BaRS direction.
+
+**Fixes:** Org-scoped referral retrieval, change detection, app-restricted access.
+**Doesn't fix:** Still polling — no push notifications.
+
+> <cite index="4-33">This stage is a pre-requisite for stage three.</cite>
+
+#### Stage 3: Pub/Sub via Multicast Notification Service (The Final Fix)
+
+<cite index="4-34,4-35">Pub/Sub is the standard solution for push notifications, rather than polling. The Multicast Notification Service provides the facilities needed to implement pub/sub in the context of eRS and it's wider partner environment.</cite>
+
+The [Multicast Notification Service (MNS)](https://digital.nhs.uk/developer/api-catalogue/multicast-notification-service) is an existing NHS platform capability that distributes event notifications to subscribers.
+
+**How it works:**
+
+- <cite index="4-36,4-37">MNS allows us to easily distribute referral update notification events. Messages contain a UBRN, version id & URL to retrieve the full referral detail.</cite>
+- <cite index="4-38,4-39">Subscribers can choose to receive their notifications either through a MESH mailbox or via an AWS SQS queue. The service hides all the detail of dealing with MESH from us - we just publish our events by posting them to a REST endpoint.</cite>
+- <cite index="4-40,4-41">Subscribers can choose the message types and filters they require when they subscribe, e.g. 'R4 Referral Updates for ODS code XXX'.</cite>
+
+**FHIR version support:**
+
+<cite index="4-42">MNS conceptually supports multiple versions of messages for the same event, which would allow for emitting notifications which refer to both STU3 & BaRS r4 end points.</cite>
+
+**Subscription management:**
+
+Two options exist:
+1. Integrator onboards with MNS directly and manages subscriptions themselves
+2. e-RS/Referral Service provides subscription management APIs and manages on the integrator's behalf (recommended — <cite index="4-43,4-44">The MNS team have expressed a preference for the latter option. It also simplifies the process for partners, removing the need for them to go through another onboarding process.</cite>)
+
+### Reference Integration Pattern
+
+The recommended integration pattern combining Stage 2 and Stage 3:
+
+1. **Subscribe** by ODS Code — to get ongoing push notifications of changes
+2. **Initial sync** — call `GET /ServiceRequest?performer:identifier={ods-code}&status=active` to get all existing in-flight referrals
+3. **On receipt of notification** — check if the referral ID is known:
+   - No → create it locally
+   - Yes → check the version ID; update if changed
+4. **Do not depend on events for SLAs** — poll `GET /ServiceRequest` frequently enough to ensure SLAs are met regardless of event delivery
+
+> <cite index="4-45,4-46">eRS is a gold level service, while MNS is bronze. We can account for this with the 'Do not depend on events for SLAs' clause in the reference integration pattern.</cite>
+
+### How This Maps to the BaRS Architecture
+
+| Component | Role in the event model |
+|---|---|
+| **BaRS Proxy** | Just transport — routes `GET /ServiceRequest` to the backend; has no role in event publishing |
+| **New Referral Service** (or legacy e-RS) | Publishes events to MNS when referrals change; serves `GET /ServiceRequest` for polling/initial sync |
+| **MNS** | Distributes notifications to subscribers via MESH or SQS |
+| **Consumer** | Subscribes to notifications; uses `GET /ServiceRequest` for initial sync and SLA fallback |
+
+The event notification contains a reference (UBRN/ServiceRequest ID + version) — **not** the full referral payload. Consumers use `GET /ServiceRequest/{id}` to retrieve the full detail when notified of a change. This keeps the event lightweight and avoids data sensitivity concerns in the notification channel.
+
+### Stage Summary
+
+| Stage | Capability | Polling still needed? | Push notifications? |
+|---|---|---|---|
+| **1: Version IDs** | Detect changes without full data pull | Yes (but cheaper) | No |
+| **2: Org-scoped GET** | Get all referrals for an org via app-restricted access | Yes (but efficient) | No |
+| **3: Pub/Sub (MNS)** | Real-time notifications when referrals change | Only as SLA fallback | Yes |
+
+---
+
 ## Open Questions
 
 | # | Question | For |
@@ -551,3 +651,8 @@ BaRS remains a standard and a proxy throughout — it never owns referral data.
 | 3 | Should the org-scoped query require CIS2 (user context) like e-RS, or is app-restricted sufficient? | Security |
 | 4 | What volume of ServiceRequests per organisation should we design for? (Affects indexing strategy) | e-RS data team |
 | 5 | Should the response include the full ServiceRequest or just summary fields (to reduce payload for large worklists)? | Architecture |
+| 6 | Which MNS subscription management model: integrator self-service or e-RS managed on behalf? | MNS team / Architecture |
+| 7 | What event types should be published? (Created, updated, cancelled, status change only?) | Architecture / e-RS team |
+| 8 | Should MNS notifications reference the STU3 endpoint, the R4 endpoint, or both? | Architecture |
+| 9 | What is the recommended polling frequency for SLA fallback when MNS is unavailable? | Service management |
+| 10 | Who publishes events — the new Referral Service, legacy e-RS, or both during transition? | Architecture |

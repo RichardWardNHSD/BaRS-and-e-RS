@@ -2,7 +2,9 @@
 
 ## Purpose
 
-This document details the design of a translation layer that sits between the e-RS database (`ersdb`) and a BaRS-aligned set of `/ServiceRequest` API operations. The translation layer enables consumers to interact with e-RS referral data through a standard FHIR R4 RESTful interface, without needing to understand the e-RS internal data model or STU3 API.
+This document details the design of the Referral Service — a new FHIR R4-native data store for all new ServiceRequests — and a translation layer that provides read-only access to legacy referrals in the e-RS database (`ersdb`).
+
+New referrals created via `POST /ServiceRequest` are stored natively as FHIR R4 in the **new R4 Repository**. The legacy `ersdb` is accessed only for reading pre-existing referrals that have not yet reached a terminal state. Over time, the translation layer handles a diminishing volume as legacy referrals complete or are cancelled, and the R4 Repository becomes the sole data store.
 
 This is complementary to the strategic analysis in [worklists-vs-service-requests.md](./worklists-vs-service-requests.md) — that document covers *why*; this document covers *how*.
 
@@ -23,37 +25,57 @@ This is complementary to the strategic analysis in [worklists-vs-service-request
                                │
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                     Translation Layer (Facade)                        │
+│                      Referral Service                                 │
 │                                                                       │
-│  ┌───────────────┐  ┌───────────────────┐  ┌─────────────────────┐ │
-│  │ Query Parser  │  │ Data Mapper       │  │ Response Assembler  │ │
-│  │ (FHIR params  │  │ (ersdb → R4       │  │ (Bundle builder,    │ │
-│  │  → DB query)  │  │  ServiceRequest)  │  │  pagination, links) │ │
-│  └───────────────┘  └───────────────────┘  └─────────────────────┘ │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │  SQL / internal query
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                         ersdb (e-RS Database)                         │
-│                                                                       │
-│  Tables: referral, referral_status, patient, service, shortlist,     │
-│          clinical_info, attachment, advice_request, ...               │
+│  ┌───────────────────────────────────────────────────────────────┐  │
+│  │                    Request Router                               │  │
+│  │  • New creates → R4 Repository                                 │  │
+│  │  • Reads → R4 Repository first; if not found → Legacy Facade   │  │
+│  │  • Updates → route to owning store (R4 or legacy)              │  │
+│  └───────────────────────────────┬───────────────────────────────┘  │
+│                                  │                                    │
+│              ┌───────────────────┴───────────────────┐               │
+│              │                                       │               │
+│              ▼                                       ▼               │
+│  ┌─────────────────────────┐         ┌─────────────────────────┐   │
+│  │   R4 Repository (New)   │         │  Translation Layer       │   │
+│  │                         │         │  (Legacy Facade)         │   │
+│  │  • Native FHIR R4 store │         │                         │   │
+│  │  • All new referrals    │         │  • Read-only access to   │   │
+│  │  • DynamoDB / FHIR DB   │         │    ersdb                 │   │
+│  │  • System of record for │         │  • STU3 → R4 mapping     │   │
+│  │    post-cutover data    │         │  • Diminishing over time  │   │
+│  └─────────────────────────┘         └────────────┬────────────┘   │
+│                                                    │                 │
+│                                                    ▼                 │
+│                                      ┌─────────────────────────┐   │
+│                                      │  ersdb (Legacy, R/O)     │   │
+│                                      │  Pre-cutover referrals   │   │
+│                                      └─────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
+
+### Data Ownership
+
+| Component | Owns | Access Mode | Lifespan |
+|---|---|---|---|
+| **R4 Repository** | All new referrals (post-cutover) | Read/Write | Permanent — the strategic store |
+| **ersdb** | All legacy referrals (pre-cutover) | Read-only (via Translation Layer) | Diminishing — retired when all legacy referrals reach terminal state |
+| **Translation Layer** | Nothing — it is a facade | Read-only query + mapping | Temporary — retired with ersdb |
 
 ---
 
 ## Supported API Operations
 
-The translation layer exposes the following FHIR R4 operations, each mapping to one or more internal e-RS database queries:
+The Referral Service exposes the following FHIR R4 operations. Write operations target the **R4 Repository**. Read operations query both stores and merge results.
 
-| Operation | HTTP | Path | Purpose |
-|-----------|------|------|---------|
-| **Search** | `GET` | `/ServiceRequest` | Retrieve referrals by patient, performer, status, date |
-| **Read** | `GET` | `/ServiceRequest/{id}` | Retrieve a single referral by logical ID |
-| **Create** | `POST` | `/ServiceRequest` | Create a new referral (write-through to ersdb) |
-| **Update** | `PUT` | `/ServiceRequest/{id}` | Full update of an existing referral |
-| **Patch** | `PATCH` | `/ServiceRequest/{id}` | Partial update (e.g. status change, triage outcome) |
+| Operation | HTTP | Path | Target Store | Purpose |
+|-----------|------|------|---|---------|
+| **Search** | `GET` | `/ServiceRequest` | R4 Repository + Legacy (merged) | Retrieve referrals by patient, performer, status, date |
+| **Read** | `GET` | `/ServiceRequest/{id}` | R4 Repository first, fallback to Legacy | Retrieve a single referral by logical ID |
+| **Create** | `POST` | `/ServiceRequest` | **R4 Repository only** | Create a new referral (never writes to ersdb) |
+| **Update** | `PUT` | `/ServiceRequest/{id}` | R4 Repository (new) or Legacy via facade (existing) | Full update of an existing referral |
+| **Patch** | `PATCH` | `/ServiceRequest/{id}` | R4 Repository (new) or Legacy via facade (existing) | Partial update (e.g. status change, triage outcome) |
 
 ### Search Parameters
 
@@ -279,49 +301,52 @@ WHERE r.ubrn = '000000070000';
 
 ## Write Operations (Create, Update, Patch)
 
-Write operations reverse the mapping — accepting FHIR R4 `ServiceRequest` payloads and translating them into `ersdb` writes.
+Write operations target the **R4 Repository** for new referrals. Updates to legacy referrals (pre-cutover) are routed to ersdb via the translation layer until those referrals reach terminal state.
 
 ### POST /ServiceRequest (Create)
 
-Creates a new referral in `ersdb`. The translation layer:
+Creates a new referral in the **R4 Repository** (never in ersdb). The Referral Service:
 
 1. Validates the incoming ServiceRequest against the UKCore-ServiceRequest profile
-2. Extracts the patient NHS Number from `subject.identifier` → looks up or creates `patient` record
-3. Resolves the performer ODS code → looks up `service` record
-4. Maps R4 fields back to `referral` table columns
-5. Generates a new UBRN
-6. Inserts into `referral` and `referral_status` tables
-7. Returns the created resource with `id`, `meta.versionId`, and `Location` header
+2. Generates a new resource ID (UUID)
+3. Stores the resource natively as FHIR R4 in the R4 Repository
+4. Sets `meta.versionId = "1"` and `meta.lastUpdated`
+5. Optionally generates a UBRN-format identifier for backward compatibility with systems expecting one
+6. Returns the created resource with `id`, `meta.versionId`, and `Location` header
 
-**Reverse mapping (R4 → ersdb):**
+**Key difference from legacy:** No mapping or translation is needed — the resource is stored as-is in its native R4 form. There is no write to ersdb.
 
-| R4 Field | ersdb Target | Transformation |
+**R4 Repository storage:**
+
+The R4 Repository stores ServiceRequest resources natively. The storage model is FHIR-first:
+
+| Stored Field | Source | Notes |
 |---|---|---|
-| `ServiceRequest.subject.identifier.value` | `referral.patient_id` (FK via lookup) | Look up patient by NHS Number |
-| `ServiceRequest.performer[0].identifier.value` | `referral.receiving_service_id` (FK via lookup) | Look up service by ODS code |
-| `ServiceRequest.requester.identifier.value` | `referral.referrer_ods_code` | Direct write |
-| `ServiceRequest.priority` | `referral.priority` | `routine` → `ROUTINE`, `urgent` → `URGENT` |
-| `ServiceRequest.code.coding[0].code` | `referral.specialty_code` | Map from SNOMED/NHS code |
-| `ServiceRequest.category[0].coding[0].code` | `referral.service_type_code` | Map from BaRS category |
-| `ServiceRequest.reasonCode[0].coding[0]` | `referral.reason_code` | SNOMED CT code |
-| `ServiceRequest.note[0].text` | `referral.clinical_info_summary` | Direct write |
-| `ServiceRequest.intent` | `referral.intent_code` | `order` → standard referral; `proposal` → A&G |
+| Resource ID (UUID) | Generated by Referral Service | Primary key |
+| Full FHIR R4 JSON | Request body (validated) | Stored as-is; no decomposition into relational columns |
+| `performer` ODS code | Extracted for indexing | GSI partition key for org-scoped queries |
+| `subject` NHS Number | Extracted for indexing | GSI partition key for patient-scoped queries |
+| `status` | Extracted for indexing | GSI sort/filter key |
+| `authoredOn` | Extracted for indexing | Sort key |
+| `meta.versionId` | Managed by service | Optimistic concurrency |
+| `meta.lastUpdated` | Managed by service | Change detection |
 
 ### PUT /ServiceRequest/{id} (Update)
 
-Full replacement of an existing referral. The translation layer:
+Full replacement of an existing referral. The Referral Service:
 
-1. Validates the incoming resource
-2. Checks `meta.versionId` matches current version (optimistic locking)
-3. Maps all fields back to `ersdb` columns
-4. Updates the `referral` record
-5. If status has changed, inserts a new `referral_status` record and marks previous as non-current
-6. Increments version
-7. Returns the updated resource
+1. Determines which store owns the resource (R4 Repository or legacy ersdb)
+2. **If R4 Repository:** Validates, checks `meta.versionId` (optimistic locking), overwrites the stored JSON, increments version
+3. **If legacy (ersdb):** Routes to the Translation Layer, which maps R4 fields back to ersdb columns and writes through — ersdb remains system of record for its own referrals until they reach terminal state
+4. Returns the updated resource
 
 ### PATCH /ServiceRequest/{id} (Partial Update)
 
-Supports JSON Patch (`application/json-patch+json`) for targeted changes. Common patch operations:
+Supports JSON Patch (`application/json-patch+json`) for targeted changes.
+
+Routing logic is the same as PUT:
+- **R4 Repository resources:** Patch is applied directly to the stored FHIR JSON
+- **Legacy resources:** Patch is translated into the appropriate ersdb column updates via the Translation Layer
 
 **Status change (e.g. triage acceptance):**
 
@@ -571,14 +596,18 @@ Organisation-scoped queries will be the primary access pattern. The following in
 
 ### Read Replica Strategy
 
-For read-heavy org-scoped queries, the translation layer should route `GET` operations to a read replica of `ersdb`:
+The Translation Layer (legacy facade) connects exclusively to a **read replica** of ersdb — it never writes to the primary:
 
 ```
-GET /ServiceRequest  → Read replica (eventual consistency, ~1s lag acceptable)
-POST /ServiceRequest → Primary (strong consistency)
-PUT /ServiceRequest  → Primary (strong consistency)
-PATCH /ServiceRequest → Primary (strong consistency)
+GET /ServiceRequest (legacy)  → ersdb Read Replica (read-only)
+POST /ServiceRequest          → R4 Repository (never touches ersdb)
+PUT /ServiceRequest (new)     → R4 Repository
+PUT /ServiceRequest (legacy)  → Routed via e-RS internal mechanisms (not direct DB write)
+PATCH /ServiceRequest (new)   → R4 Repository
+PATCH /ServiceRequest (legacy) → Routed via e-RS internal mechanisms
 ```
+
+The R4 Repository handles its own read/write patterns independently (DynamoDB scales reads and writes separately via on-demand or provisioned capacity).
 
 ---
 
@@ -678,18 +707,23 @@ translation-layer/
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| **Resource ID strategy** | Use UBRN as ServiceRequest.id | UBRNs are unique, immutable, and already the primary identifier in e-RS. Avoids maintaining a separate UUID ↔ UBRN lookup table. |
-| **Version tracking** | Use `referral.version` as `meta.versionId` | Enables optimistic locking and change detection without additional infrastructure |
+| **Resource ID strategy (new)** | UUID generated by Referral Service | Standard FHIR practice; no dependency on legacy UBRN generation |
+| **Resource ID strategy (legacy)** | Use UBRN as ServiceRequest.id | UBRNs are unique, immutable, and already the primary identifier in e-RS |
+| **New referral storage** | R4 Repository (DynamoDB or FHIR-native DB) | Native FHIR storage; no mapping overhead; purpose-built for R4 queries |
+| **Legacy referral access** | Read-only translation from ersdb | ersdb is never written to by new flows; it is legacy-only |
+| **Version tracking (new)** | Atomic counter in R4 Repository | Clean optimistic locking without legacy constraints |
+| **Version tracking (legacy)** | Use `referral.version` as `meta.versionId` | Enables change detection for legacy data |
 | **Profile** | `UKCore-ServiceRequest` | Strategic UK FHIR profile; aligns with BaRS standard |
-| **Pagination** | Offset-based (not cursor-based) | Simpler to implement against SQL; acceptable for expected page sizes (≤100) |
-| **Write-through vs event-sourced** | Write-through to ersdb | Translation layer writes directly to ersdb to maintain it as system of record during transition |
+| **Pagination** | Offset-based (not cursor-based) | Simpler to implement; acceptable for expected page sizes (≤100) |
+| **Write target** | R4 Repository for all new creates; ersdb for updates to legacy referrals only | Clean separation: new data is R4-native from day one |
 | **A&G handling** | Same resource type, distinguished by `intent=proposal` | Keeps the API surface simple; A&G is a ServiceRequest with different intent |
+| **Search merge** | Query both stores, merge, deduplicate, return single Bundle | Consumer sees a unified view regardless of where data lives |
 
 ---
 
 ## Deployment Model
 
-The translation layer is deployed as a discrete service within the e-RS infrastructure boundary (since it requires direct database access):
+The Referral Service is deployed as a discrete, independently deployable service. It owns the R4 Repository and has read-only access to ersdb via the Translation Layer:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -697,54 +731,80 @@ The translation layer is deployed as a discrete service within the e-RS infrastr
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                               │
 │  ┌──────────────┐         ┌─────────────────────────────────────────────┐   │
-│  │  BaRS Proxy  │────────▶│     e-RS Infrastructure Boundary            │   │
+│  │  BaRS Proxy  │────────▶│         Referral Service                    │   │
 │  │  (APIM)      │         │                                             │   │
 │  └──────────────┘         │  ┌───────────────────────────────────┐      │   │
-│                            │  │    Translation Layer Service       │      │   │
-│                            │  │    (Containerised / Lambda)        │      │   │
-│                            │  │                                   │      │   │
-│                            │  │  ┌──────┐ ┌──────┐ ┌──────┐     │      │   │
-│                            │  │  │Query │ │Mapper│ │Resp. │     │      │   │
-│                            │  │  │Parser│ │      │ │Assem.│     │      │   │
-│                            │  │  └──┬───┘ └──┬───┘ └──┬───┘     │      │   │
-│                            │  └─────┼────────┼────────┼──────────┘      │   │
-│                            │        │        │        │                   │   │
-│                            │        ▼        ▼        ▼                   │   │
-│                            │  ┌───────────────────────────────────┐      │   │
-│                            │  │         ersdb (PostgreSQL)         │      │   │
-│                            │  │    Primary + Read Replica          │      │   │
-│                            │  └───────────────────────────────────┘      │   │
-│                            └─────────────────────────────────────────────┘   │
+│                            │  │        Request Router              │      │   │
+│                            │  └───────┬───────────────┬───────────┘      │   │
+│                            │          │               │                   │   │
+│                            │          ▼               ▼                   │   │
+│                            │  ┌──────────────┐  ┌──────────────────┐     │   │
+│                            │  │R4 Repository │  │Translation Layer │     │   │
+│                            │  │(DynamoDB)    │  │(Legacy Facade)   │     │   │
+│                            │  │              │  │                  │     │   │
+│                            │  │• New creates │  │• Read-only       │     │   │
+│                            │  │• Updates to  │  │• ersdb → R4 map  │     │   │
+│                            │  │  new records │  │• Diminishing     │     │   │
+│                            │  └──────────────┘  └────────┬─────────┘     │   │
+│                            │                             │                │   │
+│                            └─────────────────────────────┼───────────────┘   │
+│                                                          │                    │
+│                            ┌──────────────────────────────────────────────┐  │
+│                            │       e-RS Infrastructure Boundary            │  │
+│                            │                                              │  │
+│                            │  ┌───────────────────────────────────┐       │  │
+│                            │  │     ersdb (PostgreSQL) — LEGACY    │       │  │
+│                            │  │     Read-only access via replica   │       │  │
+│                            │  │     No new writes from BaRS        │       │  │
+│                            │  └───────────────────────────────────┘       │  │
+│                            └──────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Why Inside the e-RS Boundary
+### R4 Repository Design
 
-- Direct database access avoids the overhead of calling the e-RS STU3 API and re-translating
-- Avoids the authentication complexity of e-RS API calls (CIS2 service accounts)
-- Gives full control over query performance (indexes, read replicas)
-- Keeps the translation as close to the data as possible
+The R4 Repository is a purpose-built FHIR R4 data store for new referrals:
 
-### Deployment Options
+| Aspect | Detail |
+|---|---|
+| **Storage** | DynamoDB (or equivalent document store) |
+| **Data format** | Full FHIR R4 ServiceRequest JSON stored as a document |
+| **Primary key** | Resource ID (UUID) |
+| **GSI 1** | `performer-ods + status + authoredOn` (org-scoped queries) |
+| **GSI 2** | `subject-nhs-number + authoredOn` (patient-scoped queries) |
+| **GSI 3** | `requester-ods + authoredOn` (referrer-scoped queries) |
+| **Versioning** | Atomic version counter; previous versions retained for audit |
+| **Consistency** | Strong consistency for writes; eventually consistent reads acceptable for search |
 
-| Option | Pros | Cons |
-|---|---|---|
-| **Containerised service (ECS/EKS)** | Always-on, connection pooling, predictable latency | Infrastructure cost even at low traffic |
-| **Lambda + RDS Proxy** | Scales to zero, low cost at low traffic | Cold starts, connection management complexity |
-| **Sidecar to existing e-RS** | Minimal new infrastructure, shares existing DB connections | Coupling to e-RS deployment lifecycle |
+### Why a Separate R4 Repository (Not Writing to ersdb)
 
-**Recommendation:** Containerised service (ECS Fargate) with connection pooling via PgBouncer. This provides predictable latency for org-scoped queries that may scan thousands of rows, avoids Lambda cold-start issues, and allows connection reuse across requests.
+- **Clean break:** New referrals are not constrained by the legacy relational schema
+- **No mapping overhead on writes:** Store FHIR JSON as-is; no R4 → STU3 → relational decomposition
+- **Independent scaling:** R4 Repository scales independently of ersdb
+- **No coupling to e-RS internals:** The Referral Service owns its own data; no dependency on e-RS DBA or schema changes
+- **Faster queries:** Purpose-built indexes (GSIs) designed for FHIR search patterns, not legacy worklist access patterns
+- **Clear system of record:** New referrals → R4 Repository; legacy referrals → ersdb. No ambiguity.
+
+### Translation Layer (Legacy Facade) — Read-Only
+
+The Translation Layer provides read-only access to pre-cutover referrals in ersdb:
+
+- Deployed within or adjacent to the e-RS infrastructure boundary (needs DB network access)
+- Connects to a **read replica** of ersdb — never the primary
+- Performs STU3 → R4 mapping on read
+- No writes flow from the Translation Layer to ersdb (status updates to legacy referrals are routed via the existing e-RS internal mechanisms during transition)
+- Will be retired once all legacy referrals reach terminal state
 
 ---
 
 ## Phased Rollout
 
-| Phase | Scope | Operations | Search Params | Notes |
+| Phase | Scope | Operations | Target Store | Notes |
 |---|---|---|---|---|
-| **1 — Read-only, patient-scoped** | Single referral read + patient search | `GET /ServiceRequest/{id}`, `GET /ServiceRequest?patient:identifier=...` | `_id`, `patient:identifier` | Proves the mapping; low risk; read replica only |
-| **2 — Read-only, org-scoped** | Organisation-level queries | `GET /ServiceRequest?performer:identifier=...` | `performer:identifier`, `status`, `_sort`, `_count` | Replaces worklist polling pattern |
-| **3 — Write operations** | Create, update, patch | `POST`, `PUT`, `PATCH` | — | Requires write access to primary ersdb; higher risk |
-| **4 — Full feature parity** | Includes, advanced search, A&G | All | `_include`, `requester:identifier`, `intent`, `authored`, `priority` | Feature-complete translation layer |
+| **1 — R4 Repository + read-only legacy** | New creates go to R4 Repository; reads query both stores | `POST /ServiceRequest` → R4 Repo; `GET /ServiceRequest` → merged | R4 Repository (write), ersdb (read-only) | Proves the dual-store model; new referrals are R4-native from day one |
+| **2 — Org-scoped search across both** | Organisation-level queries merging R4 + legacy results | `GET /ServiceRequest?performer:identifier=...` | Both (merged Bundle) | Replaces worklist polling pattern; consumers see unified view |
+| **3 — Updates routed correctly** | Updates to new referrals hit R4 Repo; legacy updates hit ersdb | `PUT`, `PATCH` | R4 Repo or ersdb depending on ownership | Full read/write capability |
+| **4 — Legacy wind-down** | Monitor legacy referral volume; retire Translation Layer | All | R4 Repository only | Translation Layer retired when legacy referrals reach terminal state |
 
 ### Feature Flags
 
@@ -752,14 +812,11 @@ Each phase is gated behind feature flags, allowing gradual enablement:
 
 ```json
 {
-  "read_single_enabled": true,
-  "read_patient_search_enabled": true,
-  "read_org_search_enabled": false,
-  "write_create_enabled": false,
-  "write_update_enabled": false,
-  "write_patch_enabled": false,
-  "include_patient_enabled": false,
-  "advanced_search_enabled": false
+  "r4_repository_writes_enabled": true,
+  "legacy_read_enabled": true,
+  "merged_search_enabled": true,
+  "legacy_updates_enabled": true,
+  "legacy_facade_retired": false
 }
 ```
 
@@ -781,27 +838,32 @@ Each phase is gated behind feature flags, allowing gradual enablement:
 
 | # | Question | Impact | Owner |
 |---|---|---|---|
-| 1 | What is the exact ersdb schema? (Table names, column types, relationships) | Blocks detailed query implementation | e-RS team |
-| 2 | Is direct DB access permitted, or must we go via an internal e-RS data access layer? | Determines deployment architecture | e-RS team / IG |
-| 3 | Are there referral states in ersdb not covered by the published e-RS API documentation? | May reveal unmapped statuses | e-RS team |
-| 4 | How is the UBRN generated? Can the translation layer generate them for new referrals? | Affects create flow | e-RS team |
-| 5 | What clinical coding systems does e-RS use for specialty and reason codes? | Affects code system mapping tables | e-RS team |
-| 6 | Is there an existing read replica, or does one need provisioning? | Infrastructure lead time | e-RS DBA |
-| 7 | What is the e-RS data retention policy? Are old referrals archived/purged? | Affects query scope and index design | e-RS team |
-| 8 | How should the translation layer handle in-flight referrals during the write-operation rollout? (Referrals being modified via both the legacy e-RS API and the new R4 interface simultaneously) | Data consistency during transition | Architecture |
-| 9 | Should `meta.source` indicate the origin system for translated resources? | Provenance transparency | BaRS team |
-| 10 | What SLA is expected for org-scoped queries? (P95 latency target) | Drives index and caching decisions | Product |
+| 1 | What is the exact ersdb schema? (Table names, column types, relationships) | Blocks Translation Layer query implementation | e-RS team |
+| 2 | Is read-only DB access to ersdb permitted, or must we go via an internal e-RS data access layer? | Determines Translation Layer deployment | e-RS team / IG |
+| 3 | Are there referral states in ersdb not covered by the published e-RS API documentation? | May reveal unmapped statuses in the Translation Layer | e-RS team |
+| 4 | What is the cutover date? (When do new referrals stop going to e-RS and start going to the R4 Repository?) | Determines when R4 Repository starts receiving creates | Product / Architecture |
+| 5 | What clinical coding systems does e-RS use for specialty and reason codes? | Affects Translation Layer code system mapping tables | e-RS team |
+| 6 | Is there an existing read replica of ersdb, or does one need provisioning? | Infrastructure lead time for Translation Layer | e-RS DBA |
+| 7 | What is the e-RS data retention policy? Are old referrals archived/purged? | Affects how long the Translation Layer must remain active | e-RS team |
+| 8 | How should updates to legacy referrals be handled? (Direct ersdb write via facade, or routed via e-RS internal APIs?) | Data consistency and write-path design for legacy updates | Architecture |
+| 9 | Should `meta.source` differentiate R4 Repository resources from translated legacy resources? | Provenance transparency | BaRS team |
+| 10 | What SLA is expected for org-scoped queries? (P95 latency target) | Drives R4 Repository index and capacity decisions | Product |
+| 11 | How should the merged search handle pagination across two stores? (Interleaved or sequential?) | Search implementation complexity | Engineering |
+| 12 | Should the R4 Repository use DynamoDB, a FHIR-native server (e.g., HAPI), or another store? | Technology selection for the strategic data store | Architecture |
 
 ---
 
 ## Summary
 
-This translation layer provides a standards-compliant FHIR R4 interface over the existing e-RS database, enabling consumers to interact with referral data via BaRS-aligned `/ServiceRequest` operations without coupling to the legacy STU3 API or worklist paradigm. It is designed to be:
+This design establishes a **new R4 Repository** as the strategic data store for all new referrals, with the legacy e-RS database (`ersdb`) accessed read-only for pre-existing referrals via a Translation Layer facade.
 
-- **Incrementally deployable** — read-only operations first, writes later
+The system is designed to be:
+
+- **R4-native for new data** — new ServiceRequests are stored as FHIR R4 JSON with no mapping or decomposition; the R4 Repository is the system of record from day one
+- **Legacy-aware for old data** — pre-cutover referrals are served from ersdb via the Translation Layer, mapped from STU3/relational to R4 on read
+- **Unified for consumers** — a single `/ServiceRequest` API surface queries both stores, merges results, and returns a single Bundle; consumers do not need to know where data lives
 - **Standards-compliant** — UKCore-ServiceRequest profile, standard FHIR search semantics
-- **Transparent** — e-RS-specific detail preserved via extensions, not lost in translation
-- **Performant** — indexed queries, read replicas, connection pooling for high-volume org-scoped access
-- **Transitional** — supports the hybrid model where this facade serves legacy data while new referrals are created in a purpose-built Referral Service
+- **Transparent** — e-RS-specific detail preserved via extensions on legacy referrals; new referrals are clean R4 without legacy baggage
+- **Designed for retirement** — the Translation Layer handles a diminishing volume as legacy referrals naturally complete; once all reach terminal state, the facade and ersdb access are retired entirely
 
-The long-term trajectory is for this translation layer to handle a diminishing volume of queries as active referrals naturally migrate to the new Referral Service. Eventually, when all active referrals exist natively in R4, the facade can be retired.
+The long-term end state is the R4 Repository as the sole data store, with no dependency on ersdb or the Translation Layer.

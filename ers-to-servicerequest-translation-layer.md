@@ -72,28 +72,24 @@ The Referral Service exposes the following FHIR R4 operations. Write operations 
 
 The primary mapping is from the `referral` table (and its related tables) to a FHIR R4 `ServiceRequest` resource conforming to the `UKCore-ServiceRequest` profile.
 
-```
-┌─────────────────────────────────┐         ┌─────────────────────────────────┐
-│         ersdb tables            │         │    FHIR R4 ServiceRequest       │
-├─────────────────────────────────┤         ├─────────────────────────────────┤
-│ referral.ubrn                   │───────▶│ identifier[0].value             │
-│ referral.version                │───────▶│ meta.versionId                  │
-│ referral.last_updated           │───────▶│ meta.lastUpdated                │
-│ referral_status.current_status  │───────▶│ status                          │
-│ referral.intent_code            │───────▶│ intent                          │
-│ referral.priority               │───────▶│ priority                        │
-│ referral.specialty_code         │───────▶│ code.coding[0]                  │
-│ referral.service_type_code      │───────▶│ category[0].coding[0]           │
-│ patient.nhs_number              │───────▶│ subject.identifier.value        │
-│ referral.referrer_ods_code      │───────▶│ requester.identifier.value      │
-│ service.ods_code                │───────▶│ performer[0].identifier.value   │
-│ referral.created_date           │───────▶│ authoredOn                      │
-│ referral.clinical_info_summary  │───────▶│ note[0].text                    │
-│ referral.reason_code            │───────▶│ reasonCode[0].coding[0]         │
-│ shortlist entries               │───────▶│ locationReference[]              │
-│ referral.advice_request_flag    │───────▶│ category (A&G indicator)        │
-└─────────────────────────────────┘         └─────────────────────────────────┘
-```
+| ersdb Source | → | R4 ServiceRequest Target |
+|---|---|---|
+| `referral.ubrn` | → | `identifier[0].value` |
+| `referral.version` | → | `meta.versionId` |
+| `referral.last_updated` | → | `meta.lastUpdated` |
+| `referral_status.current_status` | → | `status` |
+| `referral.intent_code` | → | `intent` |
+| `referral.priority` | → | `priority` |
+| `referral.specialty_code` | → | `code.coding[0]` |
+| `referral.service_type_code` | → | `category[0].coding[0]` |
+| `patient.nhs_number` | → | `subject.identifier.value` |
+| `referral.referrer_ods_code` | → | `requester.identifier.value` |
+| `service.ods_code` | → | `performer[0].identifier.value` |
+| `referral.created_date` | → | `authoredOn` |
+| `referral.clinical_info_summary` | → | `note[0].text` |
+| `referral.reason_code` | → | `reasonCode[0].coding[0]` |
+| `shortlist` entries | → | `locationReference[]` |
+| `referral.advice_request_flag` | → | `category` (A&G indicator) |
 
 ### Detailed Field Mapping
 

@@ -12,47 +12,18 @@ This is complementary to the strategic analysis in [worklists-vs-service-request
 
 ## Architecture Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Consumer                                     │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │  FHIR R4 (GET, POST, PUT, PATCH)
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                       BaRS Proxy (Transport)                         │
-│              Routes requests, enforces standard headers               │
-└──────────────────────────────┬──────────────────────────────────────┘
-                               │
-                               ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                      Referral Service                                 │
-│                                                                       │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                    Request Router                               │  │
-│  │  • New creates → R4 Repository                                 │  │
-│  │  • Reads → R4 Repository first; if not found → Legacy Facade   │  │
-│  │  • Updates → route to owning store (R4 or legacy)              │  │
-│  └───────────────────────────────┬───────────────────────────────┘  │
-│                                  │                                    │
-│              ┌───────────────────┴───────────────────┐               │
-│              │                                       │               │
-│              ▼                                       ▼               │
-│  ┌─────────────────────────┐         ┌─────────────────────────┐   │
-│  │   R4 Repository (New)   │         │  Translation Layer       │   │
-│  │                         │         │  (Legacy Facade)         │   │
-│  │  • Native FHIR R4 store │         │                         │   │
-│  │  • All new referrals    │         │  • Read-only access to   │   │
-│  │  • DynamoDB / FHIR DB   │         │    ersdb                 │   │
-│  │  • System of record for │         │  • STU3 → R4 mapping     │   │
-│  │    post-cutover data    │         │  • Diminishing over time  │   │
-│  └─────────────────────────┘         └────────────┬────────────┘   │
-│                                                    │                 │
-│                                                    ▼                 │
-│                                      ┌─────────────────────────┐   │
-│                                      │  ersdb (Legacy, R/O)     │   │
-│                                      │  Pre-cutover referrals   │   │
-│                                      └─────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    Consumer["Consumer"]
+    Consumer -->|"FHIR R4 (GET, POST, PUT, PATCH)"| Proxy["BaRS Proxy (Transport)<br/>Routes requests, enforces standard headers"]
+    Proxy --> RS["Referral Service"]
+
+    subgraph RS["Referral Service"]
+        Router["Request Router<br/>• New creates → R4 Repository<br/>• Reads → R4 first, fallback Legacy<br/>• Updates → route to owning store"]
+        Router --> R4["R4 Repository (New)<br/>• Native FHIR R4 store<br/>• All new referrals<br/>• DynamoDB<br/>• System of record post-cutover"]
+        Router --> TL["Translation Layer (Legacy Facade)<br/>• Read-only access to ersdb<br/>• STU3 → R4 mapping<br/>• Diminishing over time"]
+        TL --> ERSDB["ersdb (Legacy, R/O)<br/>Pre-cutover referrals"]
+    end
 ```
 
 ### Data Ownership
@@ -720,25 +691,15 @@ This is real work (10–50ms+ per referral) that produces the same output for re
 
 **How it works:**
 
-```
-GET /ServiceRequest/000000070000 (legacy)
-    │
-    ▼
-┌─────────────────────────┐
-│  Check cache:            │
-│  key = legacy:sr:070000  │
-└────────┬────────────────┘
-         │
-    ┌────┴────┐
-    │  Hit?   │
-    └────┬────┘
-         │
-    Yes ──┼──▶ Return cached R4 JSON (< 1ms)
-         │
-    No  ──┼──▶ Query ersdb read replica
-         │     Map STU3 → R4
-         │     Store in cache (TTL 60s)
-         │     Return R4 JSON
+```mermaid
+flowchart TD
+    REQ["GET /ServiceRequest/000000070000 (legacy)"]
+    REQ --> CHECK{"Check cache:<br/>key = legacy:sr:070000"}
+    CHECK -->|"Hit"| RET1["Return cached R4 JSON (< 1ms)"]
+    CHECK -->|"Miss"| QUERY["Query ersdb read replica"]
+    QUERY --> MAP["Map STU3 → R4"]
+    MAP --> STORE["Store in cache (TTL 60s)"]
+    STORE --> RET2["Return R4 JSON"]
 ```
 
 **For search operations (org-scoped queries):**
@@ -915,40 +876,24 @@ translation-layer/
 
 The Referral Service is deployed as a discrete, independently deployable service. It owns the R4 Repository and has read-only access to ersdb via the Translation Layer:
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                           NHS Spine / APIM                                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                               │
-│  ┌──────────────┐         ┌─────────────────────────────────────────────┐   │
-│  │  BaRS Proxy  │────────▶│         Referral Service                    │   │
-│  │  (APIM)      │         │                                             │   │
-│  └──────────────┘         │  ┌───────────────────────────────────┐      │   │
-│                            │  │        Request Router              │      │   │
-│                            │  └───────┬───────────────┬───────────┘      │   │
-│                            │          │               │                   │   │
-│                            │          ▼               ▼                   │   │
-│                            │  ┌──────────────┐  ┌──────────────────┐     │   │
-│                            │  │R4 Repository │  │Translation Layer │     │   │
-│                            │  │(DynamoDB)    │  │(Legacy Facade)   │     │   │
-│                            │  │              │  │                  │     │   │
-│                            │  │• New creates │  │• Read-only       │     │   │
-│                            │  │• Updates to  │  │• ersdb → R4 map  │     │   │
-│                            │  │  new records │  │• Diminishing     │     │   │
-│                            │  └──────────────┘  └────────┬─────────┘     │   │
-│                            │                             │                │   │
-│                            └─────────────────────────────┼───────────────┘   │
-│                                                          │                    │
-│                            ┌──────────────────────────────────────────────┐  │
-│                            │       e-RS Infrastructure Boundary            │  │
-│                            │                                              │  │
-│                            │  ┌───────────────────────────────────┐       │  │
-│                            │  │     ersdb (PostgreSQL) — LEGACY    │       │  │
-│                            │  │     Read-only access via replica   │       │  │
-│                            │  │     No new writes from BaRS        │       │  │
-│                            │  └───────────────────────────────────┘       │  │
-│                            └──────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph APIM["NHS Spine / APIM"]
+        Proxy["BaRS Proxy (APIM)"]
+    end
+
+    subgraph RefService["Referral Service"]
+        Router["Request Router"]
+        Router --> R4["R4 Repository (DynamoDB)<br/>• New creates<br/>• Updates to new records"]
+        Router --> TL["Translation Layer (Legacy Facade)<br/>• Read-only<br/>• ersdb → R4 mapping<br/>• Diminishing"]
+    end
+
+    subgraph eRS["e-RS Infrastructure Boundary"]
+        ERSDB["ersdb (PostgreSQL) — LEGACY<br/>Read-only access via replica<br/>No new writes from BaRS"]
+    end
+
+    Proxy --> Router
+    TL --> ERSDB
 ```
 
 ### R4 Repository Design

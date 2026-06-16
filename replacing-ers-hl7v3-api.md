@@ -37,20 +37,11 @@ The e-RS HL7 V3 API (historically the "Choose and Book" domain) is a Spine-conne
 
 ### Current Architecture (HL7 V3)
 
-```
-┌────────────────┐       HL7 V3 SOAP / ebXML        ┌────────────────┐
-│                │◄─────────────────────────────────▶│                │
-│  Secondary     │         (via NHS Spine)            │     e-RS       │
-│  Care PAS      │                                    │   (Central)    │
-│                │   • Publish slots (async)           │                │
-│  (e.g. Cerner, │   • Query slots (sync)             │                │
-│   Epic, etc.)  │   • Book/Cancel (sync)             │                │
-│                │   • Retrieve referral (sync)        │                │
-└────────────────┘   • Update status (async)          └────────────────┘
-        │                                                      │
-        │ HSCN Network                                         │
-        │ TLS-MA Auth                                          │
-        │ MHS Adaptor (ebXML)                                  │
+```mermaid
+graph LR
+    PAS["Secondary Care PAS<br/>(Cerner, Epic, etc.)"] <-->|"HL7 V3 SOAP / ebXML<br/>(via NHS Spine)"| eRS["e-RS (Central)"]
+
+    PAS -.->|"HSCN Network<br/>TLS-MA Auth<br/>MHS Adaptor (ebXML)"| SPINE["NHS Spine"]
 ```
 
 ### Why It Needs Replacing
@@ -68,21 +59,12 @@ The e-RS HL7 V3 API (historically the "Choose and Book" domain) is a Spine-conne
 
 ## Target Architecture: BaRS-Aligned Replacement
 
-```
-┌────────────────┐      FHIR R4 (HTTPS/REST)       ┌────────────────┐
-│                │◄───────────────────────────────▶│                │
-│  Secondary     │                                  │  BaRS Proxy    │
-│  Care PAS      │   Standard Pattern:              │  (Transport)   │
-│                │   • GET /Slot                     │                │
-│  (e.g. Cerner, │   • POST /Appointment            └───────┬────────┘
-│   Epic, etc.)  │   • PUT /Appointment                     │
-│                │   • GET /ServiceRequest                   │
-│                │   • PATCH /ServiceRequest                 ▼
-└────────────────┘                              ┌────────────────────┐
-        │                                       │  Translation Layer │
-        │ Internet (TLS)                        │  (e-RS Facade)     │
-        │ App-restricted JWT                    │                    │
-        │ No MHS Adaptor needed                 └────────────────────┘
+```mermaid
+graph TD
+    PAS["Secondary Care PAS<br/>(Cerner, Epic, etc.)"] <-->|"FHIR R4 (HTTPS/REST)<br/>Standard Pattern:<br/>GET /Slot, POST /Appointment<br/>PUT /Appointment, GET /ServiceRequest<br/>PATCH /ServiceRequest"| Proxy["BaRS Proxy (Transport)"]
+    Proxy --> TL["Translation Layer<br/>(e-RS Facade)<br/>ersdb"]
+
+    PAS -.->|"Internet (TLS)<br/>App-restricted JWT<br/>No MHS Adaptor needed"| Proxy
 ```
 
 ### Key Changes
@@ -114,10 +96,15 @@ The e-RS HL7 V3 API (historically the "Choose and Book" domain) is a Spine-conne
 - PAS **is the slot authority** — it holds slots locally and responds to `GET /Slot` queries directly
 - The referrer (or BaRS Proxy on behalf of the referrer) queries the PAS in real-time
 
-```
-HL7 V3:  PAS ──publish slots──▶ e-RS (stores centrally) ──serve──▶ Referrer
+```mermaid
+graph LR
+    subgraph HL7_V3["HL7 V3 (Current)"]
+        PAS1["PAS"] -->|"publish slots"| eRS1["e-RS (stores centrally)"] -->|"serve"| Ref1["Referrer"]
+    end
 
-BaRS:    Referrer ──GET /Slot──▶ BaRS Proxy ──GET /Slot──▶ PAS (responds directly)
+    subgraph BaRS["BaRS (Target)"]
+        Ref2["Referrer"] -->|"GET /Slot"| Proxy2["BaRS Proxy"] -->|"GET /Slot"| PAS2["PAS (responds directly)"]
+    end
 ```
 
 **What the PAS must implement:**
@@ -367,10 +354,10 @@ Under the BaRS model, this entire category of problem is eliminated. Slots are q
 
 During the initial transition, PAS vendors continue to operate as before (HL7 V3 or via e-RS FHIR STU3 API). The translation layer provides the FHIR R4 interface externally while interacting with ersdb internally.
 
-```
-Referrer ──GET /Slot──▶ Translation Layer ──query──▶ ersdb (slot table)
-                                                      ↑
-                                          PAS still publishes slots here via HL7 V3
+```mermaid
+graph LR
+    Ref["Referrer"] -->|"GET /Slot"| TL["Translation Layer"] -->|"query"| ERSDB["ersdb (slot table)"]
+    PAS["PAS"] -->|"still publishes slots via HL7 V3"| ERSDB
 ```
 
 This gives PAS vendors time to build their BaRS Receiver capability without breaking existing flows.
@@ -384,8 +371,9 @@ PAS vendors implement:
 
 At this point, the slot management flow bypasses the translation layer entirely:
 
-```
-Referrer ──GET /Slot──▶ BaRS Proxy ──GET /Slot──▶ PAS (responds directly, real-time)
+```mermaid
+graph LR
+    Ref["Referrer"] -->|"GET /Slot"| Proxy["BaRS Proxy"] -->|"GET /Slot"| PAS["PAS (responds directly, real-time)"]
 ```
 
 ### Phase 3: PAS Implements BaRS Consumer (Referral Operations)
@@ -476,8 +464,9 @@ This is functionally equivalent to the current HL7 V3 polling pattern but uses s
 
 The [Multicast Notification Service (MNS)](https://digital.nhs.uk/developer/api-catalogue/multicast-notification-service) provides push-based event notifications. When a referral is created or updated, an event is published:
 
-```
-ServiceRequest created/updated → MNS → Subscribed PAS systems notified
+```mermaid
+graph LR
+    SR["ServiceRequest created/updated"] --> MNS["MNS"] --> PAS["Subscribed PAS systems notified"]
 ```
 
 The PAS subscribes to events for its organisation and receives a lightweight notification (containing the ServiceRequest ID and change type). It then calls `GET /ServiceRequest/{id}` to retrieve the full details.
@@ -528,8 +517,9 @@ Systems that cannot implement a FHIR R4 Receiver can use a **PAS-side adaptor** 
 
 This is the inverse of the e-RS translation layer — it sits in front of the PAS rather than in front of the database:
 
-```
-BaRS Proxy ──GET /Slot──▶ PAS Adaptor (FHIR → native) ──▶ Legacy PAS
+```mermaid
+graph LR
+    Proxy["BaRS Proxy"] -->|"GET /Slot"| Adaptor["PAS Adaptor (FHIR → native)"] --> PAS["Legacy PAS"]
 ```
 
 ---

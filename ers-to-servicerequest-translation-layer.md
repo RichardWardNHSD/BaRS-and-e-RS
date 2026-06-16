@@ -577,12 +577,91 @@ Organisation-scoped queries will be the primary access pattern. The following in
 
 ### Caching Strategy
 
+#### R4 Repository — No Cache Required
+
+The R4 Repository does not need a read-through cache:
+
+- DynamoDB with properly designed GSIs already delivers single-digit millisecond reads
+- Data is stored as native FHIR R4 JSON — no transformation on read, just retrieve and return
+- Referral data changes frequently (status updates, new referrals arriving), making cache staleness a risk without meaningful latency benefit
+- Adding a cache in front of something already fast introduces complexity (invalidation, consistency) for negligible gain
+
+#### Translation Layer (Legacy Reads) — Cached Mapped Resources
+
+The Translation Layer benefits significantly from a cache because each legacy read involves:
+
+1. A SQL query with JOINs across 4–5 tables
+2. STU3 → R4 field mapping and extension construction
+3. Code system lookups and status translation
+
+This is real work (10–50ms+ per referral) that produces the same output for repeated requests — an ideal caching candidate.
+
+**Cache design:**
+
+| Aspect | Detail |
+|---|---|
+| **Technology** | Redis (ElastiCache) or in-memory LRU (for lower volume) |
+| **Cache key** | `legacy:servicerequest:{ubrn}:{version}` |
+| **Cached value** | The fully-mapped FHIR R4 ServiceRequest JSON |
+| **TTL** | 60 seconds |
+| **Invalidation** | Version-based — if `referral.version` in ersdb has incremented, the cached entry is stale and bypassed |
+| **Scope** | Individual resource cache (not search result sets) |
+
+**How it works:**
+
+```
+GET /ServiceRequest/000000070000 (legacy)
+    │
+    ▼
+┌─────────────────────────┐
+│  Check cache:            │
+│  key = legacy:sr:070000  │
+└────────┬────────────────┘
+         │
+    ┌────┴────┐
+    │  Hit?   │
+    └────┬────┘
+         │
+    Yes ──┼──▶ Return cached R4 JSON (< 1ms)
+         │
+    No  ──┼──▶ Query ersdb read replica
+         │     Map STU3 → R4
+         │     Store in cache (TTL 60s)
+         │     Return R4 JSON
+```
+
+**For search operations (org-scoped queries):**
+
+The cache is used at the individual-resource level, not the search-result level. When the Translation Layer executes an org-scoped query and retrieves a list of UBRNs + versions:
+
+1. For each UBRN, check the cache (`legacy:sr:{ubrn}:{version}`)
+2. If cache hit and version matches → use cached mapped resource
+3. If cache miss or version mismatch → fetch from ersdb, map, cache, return
+
+This means repeated org-scoped polls (common pattern: PAS polling every 5 minutes) benefit from the cache for referrals that haven't changed since the last poll — typically the majority.
+
+**Why 60-second TTL:**
+
+- Legacy referrals are still updated via the e-RS application (clinicians triaging, booking, etc.)
+- A 60-second TTL bounds the maximum staleness to an acceptable level for most consumers
+- Version-based invalidation provides an additional safety net — if a consumer reads a specific referral by ID, the cache checks the version before returning
+- For polling patterns (every 5 minutes), even a 60s TTL means ~80% of referrals are served from cache on each poll
+
+**What is NOT cached:**
+
+| Item | Reason |
+|---|---|
+| Search result sets (the Bundle itself) | Result sets change as referrals are created/updated; caching full Bundles risks missing new referrals |
+| R4 Repository reads | Already fast enough natively (DynamoDB < 5ms); cache adds complexity for no gain |
+| Write operations | Writes must always go to the authoritative store |
+
+#### Supporting Caches (Both Paths)
+
 | Layer | Cache Type | TTL | Invalidation |
 |---|---|---|---|
 | **Organisation/Service metadata** | In-memory (LRU) | 1 hour | On ODS lookup miss |
 | **Code system mappings** | In-memory (static) | Until deploy | Immutable per release |
-| **Query results** | None | — | Referral data changes too frequently for result caching |
-| **Patient demographics** | Short-lived (LRU) | 5 minutes | Reduces patient table joins for repeated queries |
+| **Patient demographics** (legacy path) | Short-lived (LRU) | 5 minutes | Reduces patient table joins for repeated queries |
 
 ### Volume Estimates
 

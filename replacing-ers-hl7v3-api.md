@@ -81,8 +81,7 @@ The e-RS HL7 V3 API (historically the "Choose and Book" domain) is a Spine-conne
 └────────────────┘                              ┌────────────────────┐
         │                                       │  Translation Layer │
         │ Internet (TLS)                        │  (e-RS Facade)     │
-        │ or HSCN                               │                    │
-        │ App-restricted JWT                    │  ersdb ◄──────────┘
+        │ App-restricted JWT                    │                    │
         │ No MHS Adaptor needed                 └────────────────────┘
 ```
 
@@ -91,7 +90,7 @@ The e-RS HL7 V3 API (historically the "Choose and Book" domain) is a Spine-conne
 | Aspect | HL7 V3 (Current) | BaRS (Target) |
 |---|---|---|
 | **Protocol** | HL7 V3 SOAP + ebXML | FHIR R4 RESTful (HTTPS) |
-| **Network** | HSCN only | Internet (TLS) or HSCN |
+| **Network** | HSCN only | Internet (TLS) — no HSCN connection to BaRS |
 | **Auth** | TLS-MA (certificate-based) | Signed JWT (app-restricted) or CIS2 |
 | **Messaging** | Async ebXML via MHS | Synchronous REST (fire-and-forget for events via MNS) |
 | **Data model** | HL7 V3 CDA / RIM | FHIR R4 (UKCore profiles) |
@@ -420,13 +419,13 @@ Once all connected PAS systems have migrated:
 
 | Aspect | HL7 V3 (Current) | BaRS (Target) |
 |---|---|---|
-| **Network** | HSCN (private NHS network) | Internet (public, TLS-secured) or HSCN |
+| **Network** | HSCN (private NHS network) | Internet (public, TLS-secured) — no HSCN |
 | **Connectivity** | Point-to-point via Spine routing | HTTPS to BaRS Proxy (or direct to PAS endpoint) |
 | **Adaptor** | MHS Adaptor required for ebXML | No adaptor — standard HTTPS client |
 | **Endpoint registration** | Spine endpoint (SDS/LDAP) | Endpoint Catalogue (or direct URL config) |
-| **Firewall rules** | HSCN peering + Spine allow-listing | Standard HTTPS egress (port 443) |
+| **Firewall rules** | HSCN peering + Spine allow-listing | Standard HTTPS egress (port 443) — public internet |
 
-This dramatically lowers the barrier to entry. Any system that can make HTTPS calls with a JWT can participate — no HSCN, no MHS, no Spine endpoint registration needed.
+This dramatically lowers the barrier to entry. Any system that can make HTTPS calls with a JWT can participate — no HSCN, no MHS, no Spine endpoint registration needed. BaRS is internet-only; there is no HSCN connectivity option.
 
 ---
 
@@ -434,7 +433,7 @@ This dramatically lowers the barrier to entry. Any system that can make HTTPS ca
 
 | Aspect | HL7 V3 | BaRS |
 |---|---|---|
-| **Authentication** | TLS-MA (client certificate on HSCN) | Signed JWT (RFC 7523) — app-restricted |
+| **Authentication** | TLS-MA (client certificate on HSCN) | Signed JWT (RFC 7523) — app-restricted, internet-facing |
 | **Identity** | Certificate CN identifies the system | JWT `iss` claim identifies the application |
 | **User context** | Not required (application-restricted) | Not required (app-restricted) — CIS2 optional for user-restricted flows |
 | **Authorisation** | Implicit via Spine RBAC + endpoint registration | JWT claims + `NHSD-End-User-Organisation` header validated against Endpoint Catalogue |
@@ -540,7 +539,7 @@ BaRS Proxy ──GET /Slot──▶ PAS Adaptor (FHIR → native) ──▶ Lega
 | Step | HL7 V3 (Current) | BaRS (Target) |
 |---|---|---|
 | **Assurance** | Common Assurance Process (CAP) — tailored for e-RS, heavy documentation | BaRS onboarding — lighter, self-service where possible |
-| **Network** | HSCN connection required | Internet or HSCN |
+| **Network** | HSCN connection required | Internet only (no HSCN) |
 | **Endpoint registration** | Spine Directory Service (SDS/LDAP) | Endpoint Catalogue registration |
 | **Testing** | Path to Live environments (PTL) | BaRS INT environment |
 | **Certificate** | PKCS#12 client certificate for TLS-MA | API key + JWKS key pair for signed JWT |

@@ -329,6 +329,102 @@ This returns all active ServiceRequests where organisation `R69` is the performe
 | **Status mapping** | e-RS worklist types (REFERRALS_FOR_REVIEW, etc.) are a combination of `status` + `intent` + business state. The BaRS API may need a custom search parameter or extension to replicate this filtering without requiring the consumer to understand internal e-RS state machines. |
 | **Volume** | Large providers may have thousands of active referrals. Efficient DynamoDB query patterns (GSI on performer + status) will be needed. |
 
+### Pagination in Detail
+
+Organisation-scoped queries are the primary use case that demands robust pagination. A large Trust may have 10,000–50,000 active referrals — returning all of them in a single response is impractical and wasteful.
+
+#### Parameters
+
+| Parameter | Type | Default | Max | Description |
+|---|---|---|---|---|
+| `_count` | number | 25 | 100 | Number of results per page |
+| `_offset` | number | 0 | — | Starting position in the result set |
+| `_sort` | string | `-authored` | — | Sort order (prefix `-` for descending) |
+
+#### How It Works
+
+```http
+GET /ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|R69
+    &status=active
+    &_sort=-authored
+    &_count=25
+    &_offset=0 HTTP/1.1
+```
+
+Returns the first 25 active referrals for organisation R69, sorted by most recently created first.
+
+#### Response: Bundle with Navigation Links
+
+```json
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 1420,
+  "link": [
+    {
+      "relation": "self",
+      "url": "https://api.service.nhs.uk/.../ServiceRequest?performer:identifier=...&status=active&_count=25&_offset=0"
+    },
+    {
+      "relation": "next",
+      "url": "https://api.service.nhs.uk/.../ServiceRequest?performer:identifier=...&status=active&_count=25&_offset=25"
+    },
+    {
+      "relation": "first",
+      "url": "https://api.service.nhs.uk/.../ServiceRequest?performer:identifier=...&status=active&_count=25&_offset=0"
+    }
+  ],
+  "entry": [ ... 25 ServiceRequest resources ... ]
+}
+```
+
+**Navigation link rules:**
+
+| Link | Present When |
+|---|---|
+| `self` | Always |
+| `next` | More results exist beyond the current page |
+| `previous` | `_offset > 0` |
+| `first` | Always (offset=0) |
+
+#### Consumer Pagination Pattern
+
+The expected consumer workflow (e.g., a PAS building its worklist):
+
+```
+1. GET /ServiceRequest?performer:identifier=...&status=active&_count=50
+   → Receives page 1 (50 results) + Bundle.total = 1420 + next link
+
+2. Follow the "next" link to get page 2
+   GET /ServiceRequest?...&_count=50&_offset=50
+   → Receives page 2 (50 results) + next link
+
+3. Continue until "next" link is absent (final page)
+```
+
+For worklist-style UIs, consumers typically only need the first 1–2 pages (most recent referrals). Full traversal is only needed for initial sync or reporting.
+
+#### Comparison: e-RS Worklist vs BaRS Pagination
+
+| Aspect | e-RS Worklist | BaRS GET /ServiceRequest |
+|---|---|---|
+| **Page control** | Limited — worklist returns all matching UBRNs in one response | Full control via `_count` and `_offset` |
+| **Sort control** | Fixed (by worklist type) | Consumer-specified via `_sort` |
+| **Total count** | Implicit (length of List resource) | Explicit `Bundle.total` |
+| **Incremental fetch** | Not supported — must fetch full worklist each time | Supported — page through results |
+| **Data per entry** | Reference only (UBRN) — must fetch each referral individually | Full resource inline — no N+1 problem |
+
+The BaRS pagination model gives consumers significantly more control and efficiency. Instead of fetching a flat list of 10,000 UBRNs and then retrieving each one individually, consumers receive rich ServiceRequest resources in manageable pages.
+
+#### Performance Considerations for Pagination
+
+| Concern | Mitigation |
+|---|---|
+| Deep pagination (offset > 1000) degrades SQL performance | Discourage deep pagination; suggest filtering by `authored` date range to reduce result sets |
+| `COUNT(*)` expensive on very large result sets | Omit `Bundle.total` for result sets > 5,000; consumer relies on `next` link presence |
+| Sort stability across pages | Sub-sort by resource ID within the same `authoredOn` timestamp to ensure deterministic ordering |
+| Results change between page requests | Stateless pagination — consumers may see minor inconsistencies if referrals are created/updated between pages; acceptable for most use cases |
+
 ---
 
 ## Migration Path

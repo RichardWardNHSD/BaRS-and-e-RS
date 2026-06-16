@@ -487,14 +487,125 @@ The Response Assembler constructs valid FHIR R4 Bundle responses from the mapped
 
 ### Pagination
 
-The translation layer uses offset-based pagination:
+Pagination is critical for org-scoped queries where a large provider may have tens of thousands of active referrals. The Referral Service uses standard FHIR Bundle pagination with some specific design choices for the dual-store architecture.
+
+#### Parameters
 
 | Parameter | Default | Max | Behaviour |
 |-----------|---------|-----|-----------|
 | `_count` | 25 | 100 | Number of results per page |
-| `_offset` | 0 | — | Starting position in result set |
+| `_offset` | 0 | — | Starting position in result set (offset-based) |
 
-The `Bundle.total` reflects the total matching count (requires a `COUNT(*)` query). The `Bundle.link` array contains `self`, `next`, and optionally `previous` links.
+#### Pagination Model: Offset-Based
+
+The service uses **offset-based pagination** rather than cursor-based. This means:
+
+- Each page is defined by `_offset` (start position) and `_count` (page size)
+- `Bundle.total` reflects the total matching count across both stores
+- `Bundle.link` contains navigation links (`self`, `next`, `previous`)
+- Pages are stateless — each request recalculates the result set
+
+**Why offset-based (not cursor-based):**
+
+| Factor | Offset | Cursor |
+|---|---|---|
+| Simplicity | Simple to implement and understand | Requires opaque token management |
+| Random page access | Supported (`_offset=200`) | Not supported — must traverse sequentially |
+| Dual-store merge | Easier — can calculate total and slice | Complex — cursor must encode position in two stores |
+| Consistency | May skip/duplicate if data changes between pages | Stable within a session (but stale) |
+| Performance at depth | Degrades at large offsets (thousands) | Constant regardless of position |
+
+For expected page sizes (≤100) and typical usage patterns (first few pages), offset-based is acceptable. Deep pagination (offset > 1000) is discouraged and may be rate-limited.
+
+#### Bundle Link Structure
+
+```json
+{
+  "resourceType": "Bundle",
+  "type": "searchset",
+  "total": 1420,
+  "link": [
+    {
+      "relation": "self",
+      "url": "https://api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|R69&status=active&_count=25&_offset=50"
+    },
+    {
+      "relation": "next",
+      "url": "https://api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|R69&status=active&_count=25&_offset=75"
+    },
+    {
+      "relation": "previous",
+      "url": "https://api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|R69&status=active&_count=25&_offset=25"
+    },
+    {
+      "relation": "first",
+      "url": "https://api.service.nhs.uk/booking-and-referral/FHIR/R4/ServiceRequest?performer:identifier=https://fhir.nhs.uk/Id/ods-organization-code|R69&status=active&_count=25&_offset=0"
+    }
+  ],
+  "entry": [ ... ]
+}
+```
+
+**Link rules:**
+- `self` — always present
+- `next` — present if there are more results beyond the current page
+- `previous` — present if `_offset > 0`
+- `first` — always present (offset=0)
+- `last` — optionally present (requires knowing total; may omit if expensive to calculate)
+
+#### Pagination Across Two Stores (Merged Search)
+
+When a search queries both the R4 Repository and the Translation Layer (legacy), pagination works as follows:
+
+```
+Consumer requests: GET /ServiceRequest?performer:identifier=...&_count=25&_offset=0
+
+Referral Service:
+  1. Query R4 Repository (returns count + page of results, sorted by authoredOn DESC)
+  2. Query Translation Layer / ersdb (returns count + page of results, sorted by created_date DESC)
+  3. Merge both result sets by sort key (authoredOn / created_date)
+  4. Apply _offset and _count to the merged set
+  5. Return the final page as a Bundle
+```
+
+**Two approaches to the merge:**
+
+| Approach | How It Works | Pros | Cons |
+|---|---|---|---|
+| **Fetch-and-merge** | Fetch enough results from both stores to satisfy the page, then merge and slice | Accurate total; correct sort order | Both stores queried every time; more data transferred |
+| **Waterfall** | Query R4 Repository first; if it has enough results, skip legacy; otherwise supplement from legacy | Faster as legacy volume drops to zero | Sort order across stores is approximate; total may require separate count queries |
+
+**Recommendation:** Use **fetch-and-merge** during the transition period (both stores active). Switch to waterfall (R4-first) once legacy volume is negligible. Feature-flag the strategy.
+
+#### Total Count
+
+`Bundle.total` is the count of all matching resources across both stores. This requires:
+
+- R4 Repository: `SELECT COUNT(*) ...` or DynamoDB `Query` with `Select: COUNT`
+- Translation Layer: `SELECT COUNT(*) FROM referral ... WHERE ...`
+
+For very large result sets (>10,000), the total count may be expensive. Options:
+
+| Strategy | Behaviour | When to Use |
+|---|---|---|
+| **Exact count** | Compute full count on every request | Small-to-medium result sets (< 5,000) |
+| **Estimated count** | Use approximate counts (e.g., table statistics) | Very large result sets; annotate with `Bundle.total` extension indicating estimate |
+| **Omit total** | Do not include `Bundle.total`; consumer relies on `next` link presence | When count is too expensive; FHIR spec allows omitting total |
+
+**Default behaviour:** Exact count for result sets ≤ 5,000; omit total for larger sets (consumer can still paginate via `next` link).
+
+#### Sorting
+
+Sorting interacts with pagination — results must be consistently ordered to ensure pages don't overlap or skip entries.
+
+| `_sort` value | Behaviour | Default |
+|---|---|---|
+| `-authored` | Newest first (descending `authoredOn`) | **Default if no `_sort` specified** |
+| `authored` | Oldest first (ascending `authoredOn`) | — |
+| `-_lastUpdated` | Most recently changed first | — |
+| `status` | Grouped by status | — |
+
+**Sort stability:** Within the same sort key value (e.g., same `authoredOn` timestamp), results are sub-sorted by resource ID to ensure deterministic ordering across pages.
 
 ---
 
